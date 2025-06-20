@@ -6,6 +6,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 #include <libusb-1.0/libusb.h>
 
 /*
@@ -69,12 +72,11 @@ static int cynthion_start_capture(libusb_device_handle *cynthion, int speed) {
     const uint8_t bRequest = 1;
     const uint16_t wValue = 1 | (speed << 1);
     const uint16_t wIndex = 0;
-    uint8_t data[0];
     const uint16_t wLength = 0;
     const unsigned timeout = 1000;
     int err = libusb_control_transfer(cynthion,
         bmRequestType, bRequest, wValue, 
-        wIndex, data, wLength, timeout);
+        wIndex, NULL, wLength, timeout);
     if (err < 0) {
         fprintf(stderr, "libusb_control_transfer: %s\r\n", libusb_error_name(err));
     }
@@ -180,26 +182,44 @@ static int dump_from_handle(libusb_device_handle *cynthion) {
     return err;
 }
 
-static int dump_from_device(libusb_device *cynthion_dev) {
+static libusb_device_handle *open_cynthion() {
+    libusb_device **devs;
+    int cnt = libusb_get_device_list(NULL, &devs);
+    if (cnt < 0) {
+        libusb_exit(NULL);
+        fprintf(stderr, "Error getting USB devices list.\r\n");
+        return NULL;
+    }
+
     libusb_device_handle *cynthion = NULL;
-    int r = libusb_open(cynthion_dev, &cynthion);
-    if (r != 0) {
-        fprintf(stderr, "libusb_open: %s\r\n", libusb_error_name(r));
-        return r;
+    for (int i = 0; devs[i]; i++) {
+        libusb_device *dev = devs[i];
+        struct libusb_device_descriptor desc;
+        int r = libusb_get_device_descriptor(dev, &desc);
+        if (r >= 0) {
+            if (desc.idVendor == 0x1d50 && desc.idProduct == 0x615b) {
+                int r = libusb_open(dev, &cynthion);
+                if (r != 0) {
+                    fprintf(stderr, "libusb_open: %s\r\n", libusb_error_name(r));
+                    cynthion = NULL;
+                }
+            }
+        } else {
+            fprintf(stderr, "Error getting USB device descriptor from %p.\r\n", dev);
+        }
     }
 
-    if (cynthion == NULL) {
-        fprintf(stderr, "Unexpected libusb error\r\n");
-        return -1;
-    }
+    libusb_free_device_list(devs, 1);
 
-    dump_from_handle(cynthion);
-    libusb_close(cynthion);
-    return 0;
+    return cynthion;
 }
 
 
 int main(const int argc, const char *argv[]) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
     signal(SIGABRT, &on_signal);
 	signal(SIGINT, &on_signal);
 	signal(SIGTERM, &on_signal);
@@ -220,33 +240,18 @@ int main(const int argc, const char *argv[]) {
         transfers[i].xfr = xfr;
     }
 
-    libusb_device **devs;
-    int cnt = libusb_get_device_list(NULL, &devs);
-    if (cnt < 0) {
-        libusb_exit(NULL);
-        fprintf(stderr, "Error getting USB devices list.\r\n");
-        return 1;
-    }
+    libusb_device_handle *cynthion = open_cynthion();
 
-    for (int i = 0; devs[i]; i++) {
-        libusb_device *dev = devs[i];
-        struct libusb_device_descriptor desc;
-        r = libusb_get_device_descriptor(dev, &desc);
-        if (r >= 0) {
-            if (desc.idVendor == 0x1d50 && desc.idProduct == 0x615b) {
-                fprintf(stderr, "Cynthion found!\r\n");
-                dump_from_device(dev);
-            }
-        } else {
-            fprintf(stderr, "Error getting USB device descriptor from %p.\r\n", dev);
-        }
+    if (cynthion != NULL) {
+        dump_from_handle(cynthion);
+        libusb_close(cynthion);
+    } else {
+        fprintf(stderr, "Cynthion NOT found!\r\n");
     }
 
     for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
         libusb_free_transfer(transfers[i].xfr);
     }
-
-    libusb_free_device_list(devs, 1);
     libusb_exit(NULL);
     return 0;
 }
