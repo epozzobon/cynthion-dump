@@ -4,9 +4,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <libusb-1.0/libusb.h>
-
 
 /*
 This program dumps usb data from the Cynthion to stdout as fast as possible.
@@ -14,11 +14,25 @@ We don't care about decoding the data because that can be done later,
 the objective is to be able to collect USB data for hours while piping it into gzip.
 */
 
+#define TRANSFERS_COUNT 4
+#define TRANSFER_SIZE 0x4000
+
+volatile static long long unsigned cumsum = 0;
 volatile static int caught_signal = 0;
+volatile static int do_exit = 0;
+
+struct transfer_in {
+    int index;
+    struct libusb_transfer *xfr;
+    uint8_t buf[TRANSFER_SIZE];
+};
+
+static struct transfer_in transfers[TRANSFERS_COUNT];
 
 
 static void on_signal(int sig) {
 	caught_signal = sig;
+    do_exit = 1;
 }
 
 
@@ -88,66 +102,83 @@ static int cynthion_stop_capture(libusb_device_handle *cynthion) {
 }
 
 
-static int cynthion_recv_capture_block(libusb_device_handle *cynthion, uint8_t *data, int length) {
-    assert(cynthion != NULL);
-    assert(data != NULL);
-    assert(length > 0);
+static void on_transfer_complete(struct libusb_transfer *xfr) {
+    static int last_transfer_index = TRANSFERS_COUNT-1;
 
-    const uint8_t endpoint = 0x81;
-    int transferred;
-    const unsigned timeout = 1000;
-    int err = libusb_bulk_transfer(cynthion,
-        endpoint, data, length, &transferred, timeout);
-    if (err == LIBUSB_ERROR_TIMEOUT) {
-        return 0;
+    // Assert that transfers stay in order, though I think this is redundant
+    struct transfer_in *usr = xfr->user_data;
+    assert((last_transfer_index + 1) % TRANSFERS_COUNT == usr->index);
+    last_transfer_index = usr->index;
+
+	if (xfr->status != LIBUSB_TRANSFER_COMPLETED) {
+		fprintf(stderr, "transfer status %d\r\n", xfr->status);
+        do_exit = 3;
+        return;
+	}
+
+    cumsum += xfr->actual_length;
+
+    if (xfr->actual_length <= 0) {
+		fprintf(stderr, "transfer length %d\r\n", xfr->actual_length);
+        do_exit = 4;
+        return;
     }
-    if (err != 0) {
-        fprintf(stderr, "libusb_bulk_transfer: %s\r\n", libusb_error_name(err));
-        return -1;
-    } else {
-        return transferred;
+
+    int w = fwrite(xfr->buffer, xfr->actual_length, 1, stdout);
+    if (w != 1) {
+        perror("fwrite");
+        do_exit = 5;
+        return;
     }
+
+	if (libusb_submit_transfer(xfr) < 0) {
+		fprintf(stderr, "error re-submitting URB\r\n");
+        do_exit = 7;
+        return;
+	}
 }
 
+static void cynthion_start_transfers(libusb_device_handle *cynthion)
+{
+    for (unsigned i = 0; i < TRANSFERS_COUNT; i++)
+    {
+        transfers[i].index = i;
+        libusb_fill_bulk_transfer(transfers[i].xfr, cynthion, 0x81,
+                                  transfers[i].buf, TRANSFER_SIZE,
+                                  on_transfer_complete, &transfers[i], 1000);
+        int err = libusb_submit_transfer(transfers[i].xfr);
+        if (err < 0)
+        {
+            fprintf(stderr, "libusb_submit_transfer: %s\r\n", libusb_error_name(err));
+        }
+    }
+}
 
 static int dump_from_handle(libusb_device_handle *cynthion) {
     assert(cynthion != NULL);
 
-    uint8_t data[0x4000];
-    const int length = 0x4000;
     uint8_t speeds;
     cynthion_get_speeds(cynthion, &speeds);
     cynthion_start_capture(cynthion, 0);
-    long long unsigned cumsum = 0;
+    cynthion_start_transfers(cynthion);
+
     int err = 0;
-    while (caught_signal == 0) {
-        int rx = cynthion_recv_capture_block(cynthion, data, length);
-        if (rx < 0) {
-            err = -1;
+    while (!do_exit) {
+        err = libusb_handle_events(NULL);
+        if (err != LIBUSB_SUCCESS) {
+            fprintf(stderr, "libusb_handle_events: %s\r\n", libusb_error_name(err));
             break;
         }
-        if (rx == 0) {
-            fprintf(stderr, "Cynthion timeout\r\n");
-            err = -2;
-            break;
-        }
-        int r = fwrite(data, rx, 1, stdout);
-        if (r != 1) {
-            perror("fwrite");
-            err = -3;
-            break;
-        }
-        cumsum += rx;
         fprintf(stderr, "total read: %lluB\r", cumsum);
     }
-    if (caught_signal > 0) {
+    if (caught_signal != 0) {
         fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
     }
+
     fprintf(stderr, "total read: %lluB\r\n", cumsum);
     cynthion_stop_capture(cynthion);
     return err;
 }
-
 
 static int dump_from_device(libusb_device *cynthion_dev) {
     libusb_device_handle *cynthion = NULL;
@@ -179,6 +210,16 @@ int main(const int argc, const char *argv[]) {
         return r;
     }
 
+    for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
+        struct libusb_transfer *xfr = libusb_alloc_transfer(0);
+        if (!xfr) {
+            errno = ENOMEM;
+            fprintf(stderr, "Out of memory for USB transfers!\r\n");
+            return 1;
+        }
+        transfers[i].xfr = xfr;
+    }
+
     libusb_device **devs;
     int cnt = libusb_get_device_list(NULL, &devs);
     if (cnt < 0) {
@@ -199,6 +240,10 @@ int main(const int argc, const char *argv[]) {
         } else {
             fprintf(stderr, "Error getting USB device descriptor from %p.\r\n", dev);
         }
+    }
+
+    for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
+        libusb_free_transfer(transfers[i].xfr);
     }
 
     libusb_free_device_list(devs, 1);
