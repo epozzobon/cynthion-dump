@@ -103,11 +103,11 @@ static int cynthion_stop_capture(libusb_device_handle *cynthion) {
 
 
 static void on_transfer_complete(struct libusb_transfer *xfr) {
-    static int last_transfer_index = TRANSFERS_COUNT-1;
+    static int last_transfer_index = -1;
 
     // Assert that transfers stay in order, though I think this is redundant
     struct transfer_in *usr = xfr->user_data;
-    assert((last_transfer_index + 1) % TRANSFERS_COUNT == usr->index);
+    assert((last_transfer_index + 1) % TRANSFERS_COUNT == usr->index || last_transfer_index == -1);
     last_transfer_index = usr->index;
 
 	if (xfr->status != LIBUSB_TRANSFER_COMPLETED) {
@@ -145,7 +145,7 @@ static void cynthion_start_transfers(libusb_device_handle *cynthion)
         transfers[i].index = i;
         libusb_fill_bulk_transfer(transfers[i].xfr, cynthion, 0x81,
                                   transfers[i].buf, TRANSFER_SIZE,
-                                  on_transfer_complete, &transfers[i], 1000);
+                                  on_transfer_complete, &transfers[i], 0);
         int err = libusb_submit_transfer(transfers[i].xfr);
         if (err < 0)
         {
