@@ -48,6 +48,7 @@ static int cynthion_get_speeds(libusb_device_handle *cynthion, uint8_t *speeds) 
     const uint16_t wValue = 0;
     const uint16_t wIndex = 0;
     uint8_t data[64];
+    // Even though only 1 byte is returned, packetry asks for 64 so I do the same
     const uint16_t wLength = 64;
     const unsigned timeout = 1000;
     int err = libusb_control_transfer(cynthion,
@@ -78,13 +79,7 @@ static int cynthion_start_capture(libusb_device_handle *cynthion, int speed) {
     const uint16_t wLength = 0;
     const unsigned timeout = 1000;
 
-    int err = libusb_claim_interface(cynthion, 0);
-    if (err != 0) {
-        fprintf(stderr, "libusb_claim_interface: %s\r\n", libusb_error_name(err));
-        return err;
-    }
-
-    err = libusb_control_transfer(cynthion,
+    int err = libusb_control_transfer(cynthion,
         bmRequestType, bRequest, wValue, 
         wIndex, NULL, wLength, timeout);
     if (err < 0) {
@@ -102,26 +97,20 @@ static int cynthion_stop_capture(libusb_device_handle *cynthion) {
     const uint8_t bRequest = 1;
     const uint16_t wValue = 0;
     const uint16_t wIndex = 0;
-    uint8_t data[0];
     const uint16_t wLength = 0;
     const unsigned timeout = 1000;
     int err = libusb_control_transfer(cynthion,
         bmRequestType, bRequest, wValue, 
-        wIndex, data, wLength, timeout);
+        wIndex, NULL, wLength, timeout);
     if (err < 0) {
         fprintf(stderr, "libusb_control_transfer: %s\r\n", libusb_error_name(err));
-    }
-
-    err = libusb_release_interface(cynthion, 0);
-    if (err != 0) {
-        fprintf(stderr, "libusb_release_interface: %s\r\n", libusb_error_name(err));
         return err;
     }
     return 0;
 }
 
 
-static void on_transfer_complete(struct libusb_transfer *xfr) {
+static int on_transfer_complete_impl(struct libusb_transfer *xfr) {
     static int last_transfer_index = -1;
 
     // Assert that transfers stay in order, though I think this is redundant
@@ -131,36 +120,44 @@ static void on_transfer_complete(struct libusb_transfer *xfr) {
 
 	if (xfr->status != LIBUSB_TRANSFER_COMPLETED) {
 		fprintf(stderr, "transfer status %d\r\n", xfr->status);
-        do_exit = 3;
-        return;
+        return 3;
 	}
 
     cumsum += xfr->actual_length;
 
     if (xfr->actual_length <= 0) {
 		fprintf(stderr, "transfer length %d\r\n", xfr->actual_length);
-        do_exit = 4;
-        return;
+        return 4;
     }
 
     int w = fwrite(xfr->buffer, xfr->actual_length, 1, stdout);
     if (w != 1) {
         perror("fwrite");
-        do_exit = 5;
-        return;
+        return 5;
     }
 
-	if (libusb_submit_transfer(xfr) < 0) {
+    int err = libusb_submit_transfer(xfr);
+	if (err != 0) {
 		fprintf(stderr, "error re-submitting URB\r\n");
-        do_exit = 7;
-        return;
+        return err;
 	}
+
+    return 0;
+}
+
+
+static void on_transfer_complete(struct libusb_transfer *xfr) {
+    int err = on_transfer_complete_impl(xfr);
+    if (err != 0) {
+        do_exit = err;
+    }
 }
 
 static int cynthion_start_transfers(libusb_device_handle *cynthion)
 {
     for (unsigned i = 0; i < TRANSFERS_COUNT; i++)
     {
+        assert(transfers[i].xfr != NULL);
         transfers[i].index = i;
         libusb_fill_bulk_transfer(transfers[i].xfr, cynthion, 0x81,
                                   transfers[i].buf, TRANSFER_SIZE,
@@ -169,17 +166,23 @@ static int cynthion_start_transfers(libusb_device_handle *cynthion)
         if (err != 0)
         {
             fprintf(stderr, "libusb_submit_transfer: %s\r\n", libusb_error_name(err));
+            // Cleanup the transfers that already started
+            // It shouldn't hurt to cancel transfers that didn't start yet
+            for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
+                libusb_cancel_transfer(transfers[i].xfr);
+            }
             return err;
         }
     }
     return 0;
 }
 
-static int dump_from_handle(libusb_device_handle *cynthion) {
+static int cynthion_dump(libusb_device_handle *cynthion) {
     assert(cynthion != NULL);
 
-    uint8_t speeds;
     int err;
+    uint8_t speeds;
+
     err = cynthion_get_speeds(cynthion, &speeds);
     if (err != 0) {
         return err;
@@ -192,7 +195,6 @@ static int dump_from_handle(libusb_device_handle *cynthion) {
 
     err = cynthion_start_transfers(cynthion);
     if (err == 0) {
-        err = 0;
         while (!do_exit) {
             err = libusb_handle_events(NULL);
             if (err != LIBUSB_SUCCESS) {
@@ -204,10 +206,15 @@ static int dump_from_handle(libusb_device_handle *cynthion) {
         if (caught_signal != 0) {
             fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
         }
+    
+        for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
+            libusb_cancel_transfer(transfers[i].xfr);
+        }
 
         fprintf(stderr, "total read: %lluB\r\n", cumsum);
-        cynthion_stop_capture(cynthion);
+        err = cynthion_stop_capture(cynthion);
     }
+
     return err;
 }
 
@@ -231,6 +238,9 @@ static libusb_device_handle *open_cynthion() {
                 if (r != 0) {
                     fprintf(stderr, "libusb_open: %s\r\n", libusb_error_name(r));
                     cynthion = NULL;
+                } else {
+                    assert(cynthion != NULL);
+                    break;
                 }
             }
         } else {
@@ -241,6 +251,22 @@ static libusb_device_handle *open_cynthion() {
     libusb_free_device_list(devs, 1);
 
     return cynthion;
+}
+
+static int claim_and_dump(libusb_device_handle *cynthion)
+{
+    int err = libusb_claim_interface(cynthion, 0);
+    if (err != 0) {
+        fprintf(stderr, "libusb_claim_interface: %s\r\n", libusb_error_name(err));
+        return err;
+    }
+    cynthion_dump(cynthion);
+    err = libusb_release_interface(cynthion, 0);
+    if (err != 0) {
+        fprintf(stderr, "libusb_release_interface: %s\r\n", libusb_error_name(err));
+        return err;
+    }
+    return 0;
 }
 
 
@@ -260,19 +286,22 @@ int main(const int argc, const char *argv[]) {
     }
 
     for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
-        struct libusb_transfer *xfr = libusb_alloc_transfer(0);
-        if (!xfr) {
+        transfers[i].xfr = libusb_alloc_transfer(0);
+        if (!transfers[i].xfr) {
+            // If any of the transfers fails to allocate, cancel execution entirely
             errno = ENOMEM;
             fprintf(stderr, "Out of memory for USB transfers!\r\n");
+            for (unsigned j = 0; j < i; j++) {
+                libusb_free_transfer(transfers[j].xfr);
+            }
             return 1;
         }
-        transfers[i].xfr = xfr;
     }
 
     libusb_device_handle *cynthion = open_cynthion();
 
     if (cynthion != NULL) {
-        dump_from_handle(cynthion);
+        claim_and_dump(cynthion);
         libusb_close(cynthion);
     } else {
         fprintf(stderr, "Cynthion NOT found!\r\n");
@@ -284,4 +313,3 @@ int main(const int argc, const char *argv[]) {
     libusb_exit(NULL);
     return 0;
 }
-
