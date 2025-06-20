@@ -55,13 +55,15 @@ static int cynthion_get_speeds(libusb_device_handle *cynthion, uint8_t *speeds) 
         wIndex, data, wLength, timeout);
     if (err < 0) {
         fprintf(stderr, "libusb_control_transfer: %s\r\n", libusb_error_name(err));
+        return err;
     } else if (err != 1) {
         fprintf(stderr, "libusb_control_transfer: Unexpected data size received (%d)\r\n", err);
+        return err;
     } else {
         fprintf(stderr, "Available speeds: 0x%02x\r\n", data[0]);
         *speeds = data[0];
+        return 0;
     }
-    return err;
 }
 
 
@@ -177,29 +179,35 @@ static int dump_from_handle(libusb_device_handle *cynthion) {
     assert(cynthion != NULL);
 
     uint8_t speeds;
-    cynthion_get_speeds(cynthion, &speeds);
-    cynthion_start_capture(cynthion, 0);
-    cynthion_start_transfers(cynthion);
+    int err;
+    err = cynthion_get_speeds(cynthion, &speeds);
+    if (err != 0) {
+        return err;
+    }
 
-    int err = 0;
-    while (!do_exit) {
-        err = libusb_handle_events(NULL);
-        if (err != LIBUSB_SUCCESS) {
-            fprintf(stderr, "libusb_handle_events: %s\r\n", libusb_error_name(err));
-            break;
+    err = cynthion_start_capture(cynthion, 0);
+    if (err != 0) {
+        return err;
+    }
+
+    err = cynthion_start_transfers(cynthion);
+    if (err == 0) {
+        err = 0;
+        while (!do_exit) {
+            err = libusb_handle_events(NULL);
+            if (err != LIBUSB_SUCCESS) {
+                fprintf(stderr, "libusb_handle_events: %s\r\n", libusb_error_name(err));
+                break;
+            }
+            fprintf(stderr, "total read: %lluB\r", cumsum);
         }
-        fprintf(stderr, "total read: %lluB\r", cumsum);
-    }
-    if (caught_signal != 0) {
-#ifdef _WIN32
-        fprintf(stderr, "Stopped due to signal %d\r\n", caught_signal);
-#else
-        fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
-#endif
-    }
+        if (caught_signal != 0) {
+            fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
+        }
 
-    fprintf(stderr, "total read: %lluB\r\n", cumsum);
-    cynthion_stop_capture(cynthion);
+        fprintf(stderr, "total read: %lluB\r\n", cumsum);
+        cynthion_stop_capture(cynthion);
+    }
     return err;
 }
 
