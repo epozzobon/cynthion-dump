@@ -8,6 +8,7 @@
 #include <unistd.h>
 #ifdef _WIN32
 #include <io.h>
+#include <fcntl.h> 
 #endif
 #include <libusb-1.0/libusb.h>
 
@@ -74,13 +75,21 @@ static int cynthion_start_capture(libusb_device_handle *cynthion, int speed) {
     const uint16_t wIndex = 0;
     const uint16_t wLength = 0;
     const unsigned timeout = 1000;
-    int err = libusb_control_transfer(cynthion,
+
+    int err = libusb_claim_interface(cynthion, 0);
+    if (err != 0) {
+        fprintf(stderr, "libusb_claim_interface: %s\r\n", libusb_error_name(err));
+        return err;
+    }
+
+    err = libusb_control_transfer(cynthion,
         bmRequestType, bRequest, wValue, 
         wIndex, NULL, wLength, timeout);
     if (err < 0) {
         fprintf(stderr, "libusb_control_transfer: %s\r\n", libusb_error_name(err));
+        return err;
     }
-    return err;
+    return 0;
 }
 
 
@@ -100,7 +109,13 @@ static int cynthion_stop_capture(libusb_device_handle *cynthion) {
     if (err < 0) {
         fprintf(stderr, "libusb_control_transfer: %s\r\n", libusb_error_name(err));
     }
-    return err;
+
+    err = libusb_release_interface(cynthion, 0);
+    if (err != 0) {
+        fprintf(stderr, "libusb_release_interface: %s\r\n", libusb_error_name(err));
+        return err;
+    }
+    return 0;
 }
 
 
@@ -140,7 +155,7 @@ static void on_transfer_complete(struct libusb_transfer *xfr) {
 	}
 }
 
-static void cynthion_start_transfers(libusb_device_handle *cynthion)
+static int cynthion_start_transfers(libusb_device_handle *cynthion)
 {
     for (unsigned i = 0; i < TRANSFERS_COUNT; i++)
     {
@@ -149,11 +164,13 @@ static void cynthion_start_transfers(libusb_device_handle *cynthion)
                                   transfers[i].buf, TRANSFER_SIZE,
                                   on_transfer_complete, &transfers[i], 0);
         int err = libusb_submit_transfer(transfers[i].xfr);
-        if (err < 0)
+        if (err != 0)
         {
             fprintf(stderr, "libusb_submit_transfer: %s\r\n", libusb_error_name(err));
+            return err;
         }
     }
+    return 0;
 }
 
 static int dump_from_handle(libusb_device_handle *cynthion) {
@@ -174,7 +191,11 @@ static int dump_from_handle(libusb_device_handle *cynthion) {
         fprintf(stderr, "total read: %lluB\r", cumsum);
     }
     if (caught_signal != 0) {
+#ifdef _WIN32
+        fprintf(stderr, "Stopped due to signal %d\r\n", caught_signal);
+#else
         fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
+#endif
     }
 
     fprintf(stderr, "total read: %lluB\r\n", cumsum);
@@ -217,9 +238,9 @@ static libusb_device_handle *open_cynthion() {
 
 int main(const int argc, const char *argv[]) {
 #ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
-
     signal(SIGABRT, &on_signal);
 	signal(SIGINT, &on_signal);
 	signal(SIGTERM, &on_signal);

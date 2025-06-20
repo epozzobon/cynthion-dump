@@ -1,12 +1,18 @@
 #include <assert.h>
 #include <errno.h>
 #include <signal.h>
-#include <arpa/inet.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h> 
+#include <winsock.h>
+#else
 #include <unistd.h>
+#include <arpa/inet.h>
+#endif
 
 /* Decode Cynthion dump to pcap format */
 
@@ -25,9 +31,10 @@ typedef struct ctx {
 
 
 static void on_event(ctx_t *ctx, uint8_t event_code, uint8_t a, const uint8_t b) {
-    fprintf(stderr, "Event %u (%u, %u)\n", event_code, a, b);
     if (event_code == 0) {
         ctx->clks += a * 256 + b;
+    } else {
+        fprintf(stderr, "Unknown event %u (%u, %u)\n", event_code, a, b);
     }
 }
 
@@ -47,6 +54,11 @@ static void on_packet(ctx_t *ctx, uint16_t length, uint16_t timestamp, const uin
 
 
 int main(const int argc, const char *argv[]) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
     unsigned head = 0;
     ctx_t ctx_storage = {};
     ctx_t *ctx = &ctx_storage;
