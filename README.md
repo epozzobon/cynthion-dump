@@ -2,8 +2,9 @@ This is a quick and dirty program to use the Cynthion from the command line with
 
 ## Build
 
-Just execute `make` in the project directory
+Just execute `make` in the project directory.
 
+I is also tested to compile in windows 10 64-bit using mingw.
 
 ## Setup
 
