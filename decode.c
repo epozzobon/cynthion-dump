@@ -49,7 +49,9 @@ static void on_packet(ctx_t *ctx, uint16_t length, uint16_t timestamp, const uin
     hdr.nanoseconds = htonl(ns % 1000000000);
     hdr.pkt_len = hdr.ori_pkt_len = htonl(length);
     assert (1 == fwrite(&hdr, 16, 1, stdout));
-    assert (1 == fwrite(data, length, 1, stdout));
+    if (length) {
+        assert (1 == fwrite(data, length, 1, stdout));
+    }
 }
 
 
@@ -59,60 +61,69 @@ int main(const int argc, const char *argv[]) {
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-    unsigned head = 0;
     ctx_t ctx_storage = {};
     ctx_t *ctx = &ctx_storage;
+    uint8_t hdr[4];
     static uint8_t data[0x10004];
 
     assert (1 == fwrite("\xa1\xb2\x3c\x4d\x00\x02\x00\x04"
                         "\x00\x00\x00\x00\x00\x00\x00\x00"
                         "\x00\x00\xff\xff\x00\x00\x01\x20", 24, 1, stdout));
 
+    uint16_t to_read;
+    unsigned long long count = 0;
     for (;;) {
-        int r = fread(data, 1, 0x10004 - head, stdin);
-        if (r > 0) {
-            head += r;
-            assert(head <= 0x10004);
-            unsigned pos = 0;
-            while (1) {
-                assert(head >= pos);
-                unsigned available = head - pos;
-                if (available >= 4) {
-                    if (data[pos] == 0xff) {
-                        on_event(ctx, data[pos+1], data[pos+2], data[pos+3]);
-                        pos += 4;
-                    } else {
-                        uint16_t length = htons(*((uint16_t *)&data[pos]));
-                        uint16_t timestamp = htons(*((uint16_t *)&data[pos+2]));
-                        uint8_t *packetdata = data + pos + 4;
-                        if (available >= 4 + length) {
-                            on_packet(ctx, length, timestamp, packetdata);
-                            pos += length + 4 + (length & 1);
-                        } else {
-                            break;
-                        }
-                    }
-                } else {
+        to_read = 4;
+        int r = fread(hdr, to_read, 1, stdin);
+        if (r != 1) {
+            break;
+        }
+
+        if (hdr[0] == 0xff) {
+            // First byte is 0xff, this is an event
+            on_event(ctx, hdr[1], hdr[2], hdr[3]);
+        } else {
+            // This is an USB packet.
+            uint16_t length = hdr[0] * 256 + hdr[1];
+            uint16_t timestamp = hdr[2] * 256 + hdr[3];
+
+            if (length >= 0x8000) {
+                // I don't believe an USB packet can be this long!
+                // Feel free to remove this check if it's actually possible
+                fprintf(stderr, "ERROR: Found a %uB USB packet?!", length);
+                break;
+            }
+
+            if (length > 0) {
+                to_read = length + (length & 1);  // +&1 for padding
+                r = fread(data, to_read, 1, stdin);
+                if (r != 1) {
                     break;
                 }
             }
-            memcpy(data, data + pos, head - pos);
-            head -= pos;
-            pos = 0;
-        }
-        if (r <= 0) {
-            break;
+            on_packet(ctx, length, timestamp, data);
+            count++;
         }
     }
+
+    fprintf(stderr, "%llu packets decoded.\r\n", count);
 
     if (ferror(stdin)) {
         fprintf(stderr, "stdin error\r\n");
         return 1;
     } else if (feof(stdin)) {
         return 0;
-    } else {
-        fprintf(stderr, "I have no clue why I terminated, sorry.\r\n");
+    } else if (to_read) {
+        int r = fread(data, 1, to_read, stdin);
+        if (r > 0) {
+            fprintf(stderr, "(%u bytes leftover)\r\n", r);
+        } else if (r < 0) {
+            perror("fread");
+        } else {
+            fprintf(stderr, "I have no clue why I terminated, sorry.\r\n");
+        }
         return 2;
     }
+    return 0;
 }
 
