@@ -1,4 +1,4 @@
-This is a quick and dirty program to dump USB trafficu using the Cynthion from the command line with as little overhead as possible.
+This is a quick and dirty program to dump USB traffic using the Cynthion from the command line with as little overhead as possible.
 
 ## Build
 
