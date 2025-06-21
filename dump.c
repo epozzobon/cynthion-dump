@@ -22,8 +22,8 @@ the objective is to be able to collect USB data for hours while piping it into g
 #define TRANSFER_SIZE 0x4000
 
 volatile static long long unsigned cumsum = 0;
-volatile static int caught_signal = 0;
-volatile static int do_exit = 0;
+volatile static sig_atomic_t caught_signal = 0;
+volatile static sig_atomic_t do_exit = 0;
 
 struct transfer_in {
     int index;
@@ -112,11 +112,19 @@ static int cynthion_stop_capture(libusb_device_handle *cynthion) {
 
 static int on_transfer_complete_impl(struct libusb_transfer *xfr) {
     static int last_transfer_index = -1;
+    if (do_exit) {
+        // An error already happened in another transfer, so don't output to stdout
+        return 1;
+    }
 
-    // Assert that transfers stay in order, though I think this is redundant
     struct transfer_in *usr = xfr->user_data;
-    assert((last_transfer_index + 1) % TRANSFERS_COUNT == usr->index || last_transfer_index == -1);
+    int last = last_transfer_index;
     last_transfer_index = usr->index;
+
+    if ((last + 1) % TRANSFERS_COUNT != usr->index && last != -1) {
+		fprintf(stderr, "ERROR: out of order transfers (%d after %d)!\r\n", usr->index, last);
+        return 2;
+    }
 
 	if (xfr->status != LIBUSB_TRANSFER_COMPLETED) {
 		fprintf(stderr, "transfer status %d\r\n", xfr->status);
@@ -166,15 +174,42 @@ static int cynthion_start_transfers(libusb_device_handle *cynthion)
         if (err != 0)
         {
             fprintf(stderr, "libusb_submit_transfer: %s\r\n", libusb_error_name(err));
-            // Cleanup the transfers that already started
-            // It shouldn't hurt to cancel transfers that didn't start yet
-            for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
-                libusb_cancel_transfer(transfers[i].xfr);
-            }
             return err;
         }
     }
     return 0;
+}
+
+static int cynthion_transfer_loop(libusb_device_handle *cynthion) {
+    int err = cynthion_start_transfers(cynthion);
+    while (err == 0 && do_exit == 0) {
+        err = libusb_handle_events_completed(NULL, (int*) &do_exit);
+        if (err != 0) {
+            fprintf(stderr, "libusb_handle_events: %s\r\n", libusb_error_name(err));
+        } else {
+            fprintf(stderr, "total read: %lluB\r", cumsum);
+        }
+    }
+
+    if (caught_signal != 0) {
+#ifdef _WIN32
+        fprintf(stderr, "Stopped due to signal \"%d\"\r\n", caught_signal);
+#else
+        fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
+#endif
+    }
+
+    for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
+        // Cancel transfers, even the ones that failed to start
+        int r = libusb_cancel_transfer(transfers[i].xfr);
+        if (err == 0) {
+            // Only propagate error if we didn't already have an error
+            err = r;
+        }
+    }
+
+    fprintf(stderr, "total read: %lluB\r\n", cumsum);
+    return err;
 }
 
 static int cynthion_dump(libusb_device_handle *cynthion) {
@@ -193,29 +228,10 @@ static int cynthion_dump(libusb_device_handle *cynthion) {
         return err;
     }
 
-    err = cynthion_start_transfers(cynthion);
-    if (err == 0) {
-        while (!do_exit) {
-            err = libusb_handle_events(NULL);
-            if (err != LIBUSB_SUCCESS) {
-                fprintf(stderr, "libusb_handle_events: %s\r\n", libusb_error_name(err));
-                break;
-            }
-            fprintf(stderr, "total read: %lluB\r", cumsum);
-        }
-        if (caught_signal != 0) {
-            fprintf(stderr, "Stopped due to signal \"%s\"\r\n", strsignal(caught_signal));
-        }
-    
-        for (unsigned i = 0; i < TRANSFERS_COUNT; i++) {
-            libusb_cancel_transfer(transfers[i].xfr);
-        }
+    int r = cynthion_transfer_loop(cynthion);
 
-        fprintf(stderr, "total read: %lluB\r\n", cumsum);
-        err = cynthion_stop_capture(cynthion);
-    }
-
-    return err;
+    err = cynthion_stop_capture(cynthion);
+    return err ? err : r;
 }
 
 static libusb_device_handle *open_cynthion() {
@@ -275,6 +291,7 @@ int main(const int argc, const char *argv[]) {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    setvbuf(stdout, NULL, _IOFBF, 64 * 1024);
     signal(SIGABRT, &on_signal);
 	signal(SIGINT, &on_signal);
 	signal(SIGTERM, &on_signal);
