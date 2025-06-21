@@ -43,3 +43,8 @@ Then later convert it to a readable pcap file using
 ```bash
 gunzip dump.gz -c | ./cynthion-decode > output.pcap
 ```
+
+You could even dump directly into a wireshark window, though it's not recommended because it will not be fast enough:
+```bash
+./cynthion-dump | ./cynthion-decode | wireshark -k -i -
+```
